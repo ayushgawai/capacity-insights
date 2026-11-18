@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capacity-insights"
+version = "0.1.0"
+description = "Capacity insights: utilization forecasting, data-quality checks and quarterly capacity reporting over CPU, disk and memory metrics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["numpy", "pandas", "matplotlib"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+capacity-insights = "capacity_insights.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["capacity_insights*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

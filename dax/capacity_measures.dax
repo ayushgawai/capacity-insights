@@ -1,0 +1,147 @@
+// capacity-insights — Power BI DAX measures
+// ---------------------------------------------------------------------------
+// Model assumption (see power_query.m and README.md in this folder):
+//   Table  'Utilization' with columns:
+//     timestamp (date), resource (text), host (text), app_team (text),
+//     metric (text: cpu_pct | disk_pct | memory_pct), value (decimal, %)
+// Create a disconnected parameter table 'Params' with a numeric column
+// 'Threshold' (single value, default 80) and 'HorizonDays' (default 90),
+// or replace VAR Threshold_ / Horizon_ below with literals.
+//
+// These measures mirror the Python pipeline (ingest/quality/forecast) so a
+// Power BI report and the quarterly Markdown report tell the same story.
+// The Python "STL-lite" weekly seasonal indices are approximated here by a
+// 7-day moving average baseline; exact parity is not claimed.
+
+// --- Utilisation -----------------------------------------------------------
+
+Avg Utilization % =
+AVERAGE ( Utilization[value] )
+
+Max Utilization % =
+MAX ( Utilization[value] )
+
+Latest Utilization % =
+VAR LastDate_ = CALCULATE ( MAX ( Utilization[timestamp] ), ALLEXCEPT ( Utilization, Utilization[resource], Utilization[metric] ) )
+RETURN
+CALCULATE (
+    AVERAGE ( Utilization[value] ),
+    Utilization[timestamp] = LastDate_,
+    ALLEXCEPT ( Utilization, Utilization[resource], Utilization[metric] )
+)
+
+Sample Count =
+COUNTROWS ( Utilization )
+
+Resource Count =
+DISTINCTCOUNT ( Utilization[resource] )
+
+// --- Trend (ordinary least squares of value on days since first sample) ----
+// Manual slope/intercept so it works without LINESTX (which needs newer
+// Power BI Desktop builds); equivalent to numpy.polyfit(degree=1).
+
+Trend Slope % per Day =
+VAR T =
+    ADDCOLUMNS (
+        Utilization,
+        "@x", INT ( Utilization[timestamp] - MINX ( ALL ( Utilization ), Utilization[timestamp] ) ),
+        "@y", Utilization[value]
+    )
+VAR N = COUNTROWS ( T )
+VAR Sx = SUMX ( T, [@x] )
+VAR Sy = SUMX ( T, [@y] )
+VAR Sxx = SUMX ( T, [@x] * [@x] )
+VAR Sxy = SUMX ( T, [@x] * [@y] )
+VAR Denom = N * Sxx - Sx * Sx
+RETURN
+IF ( N > 1 && Denom <> 0, ( N * Sxy - Sx * Sy ) / Denom, BLANK () )
+
+Trend Intercept % =
+VAR FirstDate = MINX ( ALL ( Utilization ), Utilization[timestamp] )
+VAR T =
+    ADDCOLUMNS (
+        Utilization,
+        "@x", INT ( Utilization[timestamp] - FirstDate ),
+        "@y", Utilization[value]
+    )
+VAR N = COUNTROWS ( T )
+RETURN
+IF ( N > 0, AVERAGEX ( T, [@y] ) - [Trend Slope % per Day] * AVERAGEX ( T, [@x] ), BLANK () )
+
+Forecast Utilization % at Horizon =
+VAR Horizon_ = SELECTEDVALUE ( Params[HorizonDays], 90 )
+VAR FirstDate = MINX ( ALL ( Utilization ), Utilization[timestamp] )
+VAR LastDate_ = MAX ( Utilization[timestamp] )
+VAR XAtHorizon = INT ( LastDate_ - FirstDate ) + Horizon_
+RETURN
+[Trend Intercept %] + [Trend Slope % per Day] * XAtHorizon
+
+// --- Forecast to threshold ---------------------------------------------------
+
+Days to Threshold =
+VAR Threshold_ = SELECTEDVALUE ( Params[Threshold], 80 )
+VAR Slope_ = [Trend Slope % per Day]
+VAR Latest_ = [Latest Utilization %]
+RETURN
+SWITCH (
+    TRUE (),
+    ISBLANK ( Slope_ ) || ISBLANK ( Latest_ ), BLANK (),
+    Latest_ >= Threshold_, 0,
+    Slope_ <= 0, BLANK (),  // never crosses on current drift
+    ( Threshold_ - Latest_ ) / Slope_
+)
+
+Projected Crossing Date =
+VAR Days_ = [Days to Threshold]
+VAR LastDate_ = MAX ( Utilization[timestamp] )
+RETURN
+IF ( ISBLANK ( Days_ ), BLANK (), LastDate_ + INT ( ROUNDUP ( Days_, 0 ) ) )
+
+Crosses Threshold Within Horizon =
+VAR Horizon_ = SELECTEDVALUE ( Params[HorizonDays], 90 )
+VAR Days_ = [Days to Threshold]
+RETURN
+IF ( ISBLANK ( Days_ ), FALSE (), Days_ <= Horizon_ )
+
+Flagged Series Count =
+SUMX (
+    SUMMARIZE ( Utilization, Utilization[resource], Utilization[metric] ),
+    IF ( [Crosses Threshold Within Horizon], 1, 0 )
+)
+
+// --- Data quality --------------------------------------------------------------
+// Mirrors quality.py: out-of-range (<0 or >100), stale, and coverage.
+
+Out-of-Range Sample Count =
+CALCULATE ( COUNTROWS ( Utilization ), Utilization[value] < 0 || Utilization[value] > 100 )
+
+Data Quality % (in range) =
+VAR Bad_ = [Out-of-Range Sample Count]
+VAR All_ = [Sample Count]
+RETURN
+IF ( All_ > 0, 1 - DIVIDE ( Bad_, All_ ), BLANK () )
+
+Days Since Last Sample =
+VAR LastDate_ = MAX ( Utilization[timestamp] )
+VAR AsOf_ = CALCULATE ( MAX ( Utilization[timestamp] ), ALL ( Utilization ) )
+RETURN
+INT ( AsOf_ - LastDate_ )
+
+Is Stale Series (7d) =
+[Days Since Last Sample] > 7
+
+Stale Series Count =
+SUMX (
+    SUMMARIZE ( Utilization, Utilization[resource], Utilization[metric] ),
+    IF ( [Is Stale Series (7d)], 1, 0 )
+)
+
+// 7-day moving average — the visual baseline the Python weekly-seasonal
+// adjustment approximates. Use on a line chart with timestamp on the axis.
+Utilization 7d Moving Avg % =
+VAR D = MAX ( Utilization[timestamp] )
+RETURN
+CALCULATE (
+    AVERAGE ( Utilization[value] ),
+    DATESINPERIOD ( Utilization[timestamp], D, -7, DAY )
+)
